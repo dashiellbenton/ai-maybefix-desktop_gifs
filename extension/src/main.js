@@ -44,7 +44,9 @@
   // or without text, comment or reply. Text comments in the same requests
   // still validated, and no other request field carries a GIF. People report
   // that it depends on where they connect from, so a blocked one still gets
-  // up to twelve tries in about half a minute. A blocked request posts
+  // up to twelve tries in about half a minute. Every second try names YouTube's
+  // mobile web client instead of the desktop one, since GIF comments are a
+  // mobile feature and the block is on desktop. A blocked request posts
   // nothing, so trying again cannot post twice.
   const RETRY_DELAYS_MS = [1000, 1500, 2000, 2000, 2500, 2500, 3000, 3000, 3000, 3000, 3000];
 
@@ -140,19 +142,31 @@
     const headers = parsed.headers;
     headers.delete('content-encoding');
     const payload = JSON.stringify(body);
+    // The same request as YouTube's mobile web client sends it. A GIF comment
+    // that YouTube blocks from the desktop client is tried again this way,
+    // since GIF comments are a mobile feature; see RETRY_DELAYS_MS.
+    const mobile = mobileVariant(body, headers);
     // A request body can be read only once, so every try builds its own.
-    const send = () => (input instanceof Request
-      ? originalFetch.call(this, new Request(input, { ...init, body: payload, headers }))
-      : originalFetch.call(this, input, { ...init, body: payload, headers }));
+    const send = (variant) => {
+      const options = { ...init, body: variant.payload, headers: variant.headers };
+      return input instanceof Request
+        ? originalFetch.call(this, new Request(input, options))
+        : originalFetch.call(this, input, options);
+    };
+    const desktop = { client: 'WEB', payload, headers };
 
     const tries = RETRY_DELAYS_MS.length + 1;
     let response;
     let verdict;
     let attempt = 0;
+    let client = desktop.client;
     for (;;) {
       attempt++;
+      // Desktop first, then the mobile web client and desktop in turn.
+      const variant = mobile && attempt % 2 === 0 ? mobile : desktop;
+      client = variant.client;
       try {
-        response = await send();
+        response = await send(variant);
       } catch (e) {
         toContent({ type: 'result', nonce, ok: false, error: 'The request could not be sent. Nothing was posted.' });
         throw e;
@@ -188,6 +202,7 @@
         hasText: !!ownText,
         kind: verdict.kind,
         tries: attempt,
+        client,
         httpStatus: verdict.httpStatus,
         apiStatus: verdict.apiStatus,
         actionStatus: verdict.actionStatus,
@@ -196,6 +211,21 @@
     }
     toContent({ type: 'result', nonce, ok: verdict.kind === 'posted', error });
     return response;
+  }
+
+  // The body and headers of a request, with the client it names switched from
+  // desktop (WEB, 1) to mobile web (MWEB, 2). Both share the version scheme,
+  // the cookies and the API key, so only the name changes. null when the
+  // request does not name the desktop client.
+  function mobileVariant(body, headers) {
+    const client = body.context && body.context.client;
+    if (!client || client.clientName !== 'WEB') return null;
+    const copy = JSON.parse(JSON.stringify(body));
+    copy.context.client.clientName = 'MWEB';
+    copy.context.client.platform = 'MOBILE';
+    const mobileHeaders = new Headers(headers);
+    if (mobileHeaders.has('x-youtube-client-name')) mobileHeaders.set('x-youtube-client-name', '2');
+    return { client: 'MWEB', payload: JSON.stringify(copy), headers: mobileHeaders };
   }
 
   function textOf(value) {

@@ -129,6 +129,49 @@ test('a G-rated GIF blocked once and then accepted is posted on the second try',
   assert.equal(h.warnings.length, 0);
 });
 
+test('a blocked G-rated GIF is retried as the mobile web client, then as desktop, in turn', async () => {
+  const h = hook(invalid, 400);
+  h.arm(true);
+  await h.window.fetch(create, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-YouTube-Client-Name': '1', 'X-YouTube-Client-Version': '2.20261014.01.00' },
+    body: JSON.stringify({ context: { client: { clientName: 'WEB', clientVersion: '2.20261014.01.00', platform: 'DESKTOP', hl: 'en' } }, createCommentParams: 'original-params', commentText: `hello ${marker}` }),
+  });
+  assert.equal(h.requests.length, 12);
+  for (const [i, request] of h.requests.entries()) {
+    const body = await request.json();
+    const mobile = i % 2 === 1;
+    assert.equal(body.context.client.clientName, mobile ? 'MWEB' : 'WEB');
+    assert.equal(body.context.client.platform, mobile ? 'MOBILE' : 'DESKTOP');
+    assert.equal(body.context.client.clientVersion, '2.20261014.01.00');
+    assert.equal(body.context.client.hl, 'en');
+    assert.equal(request.headers.get('X-YouTube-Client-Name'), mobile ? '2' : '1');
+    assert.equal(body.commentText, 'hello');
+    assert.equal(body.tenorId, id);
+    assert.equal(body.createCommentParams, 'original-params');
+  }
+  assert.equal(JSON.parse(h.warnings[0][1]).client, 'MWEB');
+});
+
+test('a G-rated GIF blocked from desktop is posted as the mobile web client', async () => {
+  const h = hook(invalid, 400, success);
+  h.arm(true);
+  assert.equal(await h.send(), h.responses[1]);
+  assert.equal((await h.requests[0].json()).context.client.clientName, 'WEB');
+  assert.equal((await h.requests[1].json()).context.client.clientName, 'MWEB');
+  assert.equal(h.requests[1].headers.has('X-YouTube-Client-Name'), false);
+  assert.equal(h.result().ok, true);
+});
+
+test('a request without a desktop client context is retried unchanged', async () => {
+  const g = hook(invalid, 400);
+  g.arm(true);
+  await g.window.fetch(create, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ commentText: `hi ${marker}` }) });
+  assert.equal(g.requests.length, 12);
+  for (const request of g.requests) assert.equal('context' in (await request.json()), false);
+  assert.equal(JSON.parse(g.warnings[0][1]).client, 'WEB');
+});
+
 test('nested response commands expose their error text', async () => {
   const h = hook({ onResponseReceivedEndpoints: [{ commandExecutorCommand: { commands: [{ showErrorAction: { errorMessage: { messageRenderer: { text: { simpleText: 'Please sign in again.' } } } } }] } }] });
   h.arm();
