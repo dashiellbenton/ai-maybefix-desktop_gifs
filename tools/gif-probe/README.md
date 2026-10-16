@@ -27,3 +27,9 @@ clients attach one; open a video's comments before posting so those load.
 sending it, and decodes its opaque `createCommentParams` (or reply params) as
 protobuf, to look for a flag that YouTube may now check before it takes a GIF.
 YouTube shows an error for that comment, since nothing is sent.
+
+**Test edited params** sends the GIF with the page's own params edited, one
+field at a time (fields 53, 45 and 10, set or dropped), stopping at the first
+that YouTube does not refuse. If every GIF variant is refused, a last try posts
+the text alone with edited params, to show whether YouTube honours edited
+params at all.

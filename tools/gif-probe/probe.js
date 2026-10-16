@@ -17,6 +17,7 @@
   const leads = new Map();
   let armed = false;
   let capturing = false;
+  let paramArmed = false;
   let running = false;
   let report = null;
   let ui = null;
@@ -169,6 +170,131 @@
     return params;
   }
 
+  // The top-level fields of a protobuf, each with its exact bytes, so that a
+  // params string can be edited without re-encoding what is left alone.
+  function topLevel(bytes) {
+    const out = [];
+    let i = 0;
+    const varint = () => {
+      let v = 0n; let shift = 0n;
+      for (;;) { const b = bytes[i++]; v |= BigInt(b & 0x7f) << shift; if (!(b & 0x80)) return v; shift += 7n; }
+    };
+    while (i < bytes.length) {
+      const start = i;
+      const key = Number(varint());
+      const type = key & 7;
+      if (type === 0) varint();
+      else if (type === 1) i += 8;
+      else if (type === 5) i += 4;
+      else if (type === 2) { const len = Number(varint()); i += len; }
+      else throw new Error(`wire type ${type}`);
+      out.push({ field: key >> 3, bytes: bytes.slice(start, i) });
+    }
+    return out;
+  }
+  function encVarint(n) {
+    let v = BigInt(n); const out = [];
+    do { let b = Number(v & 0x7fn); v >>= 7n; if (v) b |= 0x80; out.push(b); } while (v);
+    return out;
+  }
+  function paramsString(bytes) {
+    const b64 = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_');
+    return encodeURIComponent(b64);
+  }
+  // edits: { field: number | null }; null drops the field, a number sets it as
+  // a varint (replacing any earlier value).
+  function editParams(raw, edits) {
+    const fields = topLevel(b64bytes(raw));
+    const kept = fields.filter((f) => !(String(f.field) in edits));
+    const bytes = kept.flatMap((f) => [...f.bytes]);
+    for (const [field, value] of Object.entries(edits)) {
+      if (value === null) continue;
+      bytes.push(...encVarint(Number(field) << 3), ...encVarint(value));
+    }
+    return paramsString(Uint8Array.from(bytes));
+  }
+
+  // GIF requests with the page's own params edited. The last one carries no
+  // GIF: it posts the text alone, to show whether YouTube honours edited
+  // params at all. It runs only when every GIF variant was refused.
+  const PARAM_VARIANTS = [
+    { name: 'GIF, params unchanged (control)', edits: {}, gif: true },
+    { name: 'GIF, field 53 = 1', edits: { 53: 1 }, gif: true },
+    { name: 'GIF, field 53 = 2', edits: { 53: 2 }, gif: true },
+    { name: 'GIF, field 53 dropped', edits: { 53: null }, gif: true },
+    { name: 'GIF, field 45 = 0', edits: { 45: 0 }, gif: true },
+    { name: 'GIF, field 45 dropped', edits: { 45: null }, gif: true },
+    { name: 'GIF, fields 45 and 53 dropped', edits: { 45: null, 53: null }, gif: true },
+    { name: 'GIF, field 10 dropped', edits: { 10: null }, gif: true },
+    { name: 'GIF, field 53 = 1 and field 10 dropped', edits: { 53: 1, 10: null }, gif: true },
+    { name: 'TEXT ONLY, field 53 = 1 (are edited params accepted?)', edits: { 53: 1 }, gif: false },
+  ];
+
+  async function paramProbe(url, input, init) {
+    running = true;
+    try {
+      const gif = (ui && ui.gif.value.trim()) || DEFAULT_GIF;
+      const parsed = await readBody(input, init);
+      const base = parsed.body;
+      const key = Object.keys(base).find((k) => /Params$/.test(k) && typeof base[k] === 'string');
+      if (!key) throw new Error('no params in the request');
+      const raw = base[key];
+      report = {
+        probe: '0.0.3',
+        mode: 'params',
+        endpoint: CREATE_URL.exec(url)[1] ? 'create_comment_reply' : 'create_comment',
+        gif,
+        hasText: typeof base.commentText === 'string' && base.commentText.trim() !== '',
+        paramsKey: key,
+        params: decodeParams(base),
+        // Our encoder must reproduce the page's string exactly when nothing changes.
+        roundTrip: editParams(raw, {}) === raw,
+        tries: [],
+      };
+      render('Running…');
+      let last = null;
+      for (const v of PARAM_VARIANTS) {
+        if (!v.gif && !report.hasText) continue;
+        const body = { ...base, [key]: editParams(raw, v.edits) };
+        if (v.gif) body.tenorId = gif;
+        const t = { variant: v.name, params: body[key] };
+        const options = { ...init, body: JSON.stringify(body), headers: parsed.headers };
+        try {
+          last = await originalFetch.call(window, input instanceof Request ? new Request(input, options) : input, options);
+          t.http = last.status;
+          let json = null;
+          try { json = await last.clone().json(); } catch (e) { t.unreadable = true; }
+          if (json && json.error) t.error = { status: json.error.status, message: json.error.message, details: json.error.details };
+          if (json && json.actionResult) t.actionStatus = json.actionResult.status;
+          const errs = json ? errorTexts(json) : [];
+          if (errs.length) t.errorActions = errs;
+        } catch (e) {
+          t.fetchError = String(e);
+        }
+        report.tries.push(t);
+        render('Running…');
+        const refused = (t.http >= 400 && t.http < 500) || (t.http === 200 && t.actionStatus !== 'STATUS_SUCCEEDED' && t.errorActions);
+        if (!refused) {
+          report.stoppedAt = v.name;
+          report.outcome = t.actionStatus === 'STATUS_SUCCEEDED' && !t.errorActions
+            ? (v.gif ? 'GIF POSTED with this variant: check it is up and stays up' : 'text-only control posted: edited params are accepted')
+            : 'unclear: check the comments';
+          break;
+        }
+        await sleep(1500);
+      }
+      if (!report.outcome) report.outcome = 'every variant refused; nothing was posted';
+      return last;
+    } catch (e) {
+      report = { probe: '0.0.3', mode: 'params', failed: String(e) };
+      return new Response(JSON.stringify({ error: { code: 400, message: 'The Desktop GIFs probe failed; nothing was posted.', status: 'INVALID_ARGUMENT' } }), { status: 400, headers: { 'content-type': 'application/json' } });
+    } finally {
+      paramArmed = false;
+      running = false;
+      render(report && report.failed ? 'The probe failed; nothing was posted.' : 'Done. Copy the report into the chat.');
+    }
+  }
+
   // Records the request's params and posts nothing.
   async function capture(url, input, init) {
     running = true;
@@ -282,6 +408,7 @@
   window.fetch = function (input, init) {
     let url = '';
     try { url = typeof input === 'string' ? input : input instanceof Request ? input.url : String(input); } catch (e) { /* ignore */ }
+    if (paramArmed && !running && CREATE_URL.test(url)) return paramProbe(url, input, init);
     if (capturing && !running && CREATE_URL.test(url)) return capture(url, input, init);
     if (armed && !running && CREATE_URL.test(url)) return probe(url, input, init);
     const res = originalFetch.apply(this, arguments);
@@ -298,10 +425,12 @@
   function render(status) {
     if (!ui) return;
     if (status) ui.status.textContent = status;
-    ui.arm.textContent = armed ? 'Armed: next Comment click is probed (click to disarm)' : 'Arm';
+    ui.arm.textContent = armed ? 'Armed: next Comment click is probed (click to disarm)' : 'Test client names (done)';
     ui.arm.style.background = armed ? '#c00' : '#333';
     ui.cap.textContent = capturing ? 'Capturing: next Comment click is recorded, not posted (click to stop)' : 'Capture params (posts nothing)';
     ui.cap.style.background = capturing ? '#06c' : '#333';
+    ui.pr.textContent = paramArmed ? 'Armed: next Comment click tests edited params (click to disarm)' : 'Test edited params (new)';
+    ui.pr.style.background = paramArmed ? '#c00' : '#063';
     ui.out.value = fullReport();
   }
 
@@ -319,10 +448,13 @@
     gifRow.append(gif);
     const arm = document.createElement('button');
     arm.style.cssText = 'display:block;width:100%;margin:6px 0;color:#fff;border:0;padding:6px;cursor:pointer';
-    arm.onclick = () => { if (!running) { armed = !armed; if (armed) capturing = false; render(armed ? 'Write a test comment and press YouTube\'s Comment button.' : 'Disarmed.'); } };
+    arm.onclick = () => { if (!running) { armed = !armed; if (armed) { capturing = false; paramArmed = false; } render(armed ? 'Write a test comment and press YouTube\'s Comment button.' : 'Disarmed.'); } };
     const cap = document.createElement('button');
     cap.style.cssText = 'display:block;width:100%;margin:0 0 6px;color:#fff;border:0;padding:6px;cursor:pointer';
-    cap.onclick = () => { if (!running) { capturing = !capturing; if (capturing) armed = false; render(capturing ? 'Write anything and press Comment. Nothing will be posted.' : 'Stopped capturing.'); } };
+    cap.onclick = () => { if (!running) { capturing = !capturing; if (capturing) { armed = false; paramArmed = false; } render(capturing ? 'Write anything and press Comment. Nothing will be posted.' : 'Stopped capturing.'); } };
+    const pr = document.createElement('button');
+    pr.style.cssText = 'display:block;width:100%;margin:0 0 6px;color:#fff;border:0;padding:6px;cursor:pointer';
+    pr.onclick = () => { if (!running) { paramArmed = !paramArmed; if (paramArmed) { armed = false; capturing = false; } render(paramArmed ? 'Write a test comment and press Comment.' : 'Disarmed.'); } };
     const status = document.createElement('div');
     const out = document.createElement('textarea');
     out.readOnly = true;
@@ -335,9 +467,9 @@
     hide.textContent = 'Hide';
     hide.onclick = () => box.remove();
     row.append(copy, ' ', hide);
-    box.append(title, gifRow, arm, cap, status, out, row);
+    box.append(title, gifRow, pr, arm, cap, status, out, row);
     document.body.append(box);
-    ui = { gif, arm, cap, status, out };
+    ui = { gif, arm, cap, pr, status, out };
     // Whatever YouTube put in the page before the probe saw any request.
     if (window.ytInitialData) scan(window.ytInitialData, 'ytInitialData');
     render('Open a video, click Arm, then post a test comment.');
