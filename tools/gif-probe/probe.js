@@ -16,6 +16,7 @@
   const originalFetch = window.fetch;
   const leads = new Map();
   let armed = false;
+  let capturing = false;
   let running = false;
   let report = null;
   let ui = null;
@@ -115,6 +116,81 @@
     }
   }
 
+  // A generic protobuf decoder for YouTube's opaque *Params strings: field
+  // number -> value, with nested messages decoded where they parse cleanly.
+  function b64bytes(str) {
+    let t = decodeURIComponent(str).replace(/-/g, '+').replace(/_/g, '/');
+    while (t.length % 4) t += '=';
+    return Uint8Array.from(atob(t), (c) => c.charCodeAt(0));
+  }
+  function decodeProto(bytes, depth = 0) {
+    const out = [];
+    let i = 0;
+    const varint = () => {
+      let v = 0n; let shift = 0n;
+      for (;;) {
+        if (i >= bytes.length) throw new Error('eof');
+        const b = bytes[i++];
+        v |= BigInt(b & 0x7f) << shift;
+        if (!(b & 0x80)) return v;
+        shift += 7n;
+      }
+    };
+    while (i < bytes.length) {
+      const key = Number(varint());
+      const field = key >> 3; const type = key & 7;
+      if (field === 0) throw new Error('field 0');
+      if (type === 0) out.push([field, 'varint', varint().toString()]);
+      else if (type === 1) { out.push([field, 'fixed64', [...bytes.slice(i, i + 8)].join(',')]); i += 8; }
+      else if (type === 5) { out.push([field, 'fixed32', [...bytes.slice(i, i + 4)].join(',')]); i += 4; }
+      else if (type === 2) {
+        const len = Number(varint());
+        if (i + len > bytes.length) throw new Error('eof');
+        const chunk = bytes.slice(i, i + len); i += len;
+        let nested = null;
+        if (depth < 8 && len) { try { nested = decodeProto(chunk, depth + 1); } catch (e) { /* not a message */ } }
+        const text = new TextDecoder('utf-8', { fatal: false }).decode(chunk);
+        const printable = /^[\x20-\x7e]*$/.test(text);
+        // Strings that also happen to parse as messages are shown as both.
+        out.push([field, 'bytes', printable ? text : null, nested]);
+      } else throw new Error(`wire type ${type}`);
+    }
+    return out;
+  }
+
+  function decodeParams(body) {
+    const params = {};
+    for (const [k, v] of Object.entries(body)) {
+      if (!/Params$/.test(k) || typeof v !== 'string') continue;
+      let decoded;
+      try { decoded = decodeProto(b64bytes(v)); } catch (e) { decoded = `undecodable: ${e.message}`; }
+      params[k] = { raw: v, decoded };
+    }
+    return params;
+  }
+
+  // Records the request's params and posts nothing.
+  async function capture(url, input, init) {
+    running = true;
+    try {
+      const parsed = await readBody(input, init);
+      report = {
+        probe: '0.0.2',
+        mode: 'capture',
+        endpoint: CREATE_URL.exec(url)[1] ? 'create_comment_reply' : 'create_comment',
+        requestFields: Object.keys(parsed.body),
+        params: decodeParams(parsed.body),
+      };
+    } catch (e) {
+      report = { probe: '0.0.2', mode: 'capture', failed: String(e) };
+    } finally {
+      capturing = false;
+      running = false;
+      render('Captured. Nothing was posted; YouTube will show an error. Copy the report.');
+    }
+    return new Response(JSON.stringify({ error: { code: 400, message: 'Blocked by the Desktop GIFs probe; nothing was posted.', status: 'INVALID_ARGUMENT' } }), { status: 400, headers: { 'content-type': 'application/json' } });
+  }
+
   function variantRequest(base, headers, v) {
     const body = JSON.parse(JSON.stringify(base));
     const client = body.context && body.context.client;
@@ -136,7 +212,7 @@
       return await runProbe(url, input, init);
     } catch (e) {
       // Nothing was sent by the probe itself: let the page's request through.
-      report = { probe: '0.0.1', failed: String(e) };
+      report = { probe: '0.0.2', failed: String(e) };
       return originalFetch.call(window, input, init);
     } finally {
       armed = false;
@@ -151,12 +227,13 @@
     const base = parsed.body;
     const client = (base.context && base.context.client) || {};
     report = {
-      probe: '0.0.1',
+      probe: '0.0.2',
       when: new Date().toISOString(),
       endpoint: CREATE_URL.exec(url)[1] ? 'create_comment_reply' : 'create_comment',
       gif,
       hasText: typeof base.commentText === 'string' && base.commentText.trim() !== '',
       requestFields: Object.keys(base),
+      params: decodeParams(base),
       requestHeaders: [...parsed.headers.keys()],
       pageClient: { clientName: client.clientName, clientVersion: client.clientVersion, platform: client.platform, gl: client.gl, hl: client.hl },
       tries: [],
@@ -205,6 +282,7 @@
   window.fetch = function (input, init) {
     let url = '';
     try { url = typeof input === 'string' ? input : input instanceof Request ? input.url : String(input); } catch (e) { /* ignore */ }
+    if (capturing && !running && CREATE_URL.test(url)) return capture(url, input, init);
     if (armed && !running && CREATE_URL.test(url)) return probe(url, input, init);
     const res = originalFetch.apply(this, arguments);
     if (SCAN_URL.test(url)) {
@@ -222,6 +300,8 @@
     if (status) ui.status.textContent = status;
     ui.arm.textContent = armed ? 'Armed: next Comment click is probed (click to disarm)' : 'Arm';
     ui.arm.style.background = armed ? '#c00' : '#333';
+    ui.cap.textContent = capturing ? 'Capturing: next Comment click is recorded, not posted (click to stop)' : 'Capture params (posts nothing)';
+    ui.cap.style.background = capturing ? '#06c' : '#333';
     ui.out.value = fullReport();
   }
 
@@ -239,7 +319,10 @@
     gifRow.append(gif);
     const arm = document.createElement('button');
     arm.style.cssText = 'display:block;width:100%;margin:6px 0;color:#fff;border:0;padding:6px;cursor:pointer';
-    arm.onclick = () => { if (!running) { armed = !armed; render(armed ? 'Write a test comment and press YouTube\'s Comment button.' : 'Disarmed.'); } };
+    arm.onclick = () => { if (!running) { armed = !armed; if (armed) capturing = false; render(armed ? 'Write a test comment and press YouTube\'s Comment button.' : 'Disarmed.'); } };
+    const cap = document.createElement('button');
+    cap.style.cssText = 'display:block;width:100%;margin:0 0 6px;color:#fff;border:0;padding:6px;cursor:pointer';
+    cap.onclick = () => { if (!running) { capturing = !capturing; if (capturing) armed = false; render(capturing ? 'Write anything and press Comment. Nothing will be posted.' : 'Stopped capturing.'); } };
     const status = document.createElement('div');
     const out = document.createElement('textarea');
     out.readOnly = true;
@@ -252,9 +335,9 @@
     hide.textContent = 'Hide';
     hide.onclick = () => box.remove();
     row.append(copy, ' ', hide);
-    box.append(title, gifRow, arm, status, out, row);
+    box.append(title, gifRow, arm, cap, status, out, row);
     document.body.append(box);
-    ui = { gif, arm, status, out };
+    ui = { gif, arm, cap, status, out };
     // Whatever YouTube put in the page before the probe saw any request.
     if (window.ytInitialData) scan(window.ytInitialData, 'ytInitialData');
     render('Open a video, click Arm, then post a test comment.');

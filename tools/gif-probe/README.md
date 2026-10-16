@@ -22,3 +22,8 @@ and version, and YouTube's answers. It holds no cookies, auth header values or
 comment text. It also lists every place in the page's YouTube data whose name
 or text mentions GIFs or Tenor (`gifLeads`), as a hint of how YouTube's own
 clients attach one; open a video's comments before posting so those load.
+
+**Capture params (posts nothing)** records the next comment request instead of
+sending it, and decodes its opaque `createCommentParams` (or reply params) as
+protobuf, to look for a flag that YouTube may now check before it takes a GIF.
+YouTube shows an error for that comment, since nothing is sent.
